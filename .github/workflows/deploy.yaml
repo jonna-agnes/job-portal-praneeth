@@ -248,31 +248,43 @@ jobs:
 
           NEW_IMAGE="${{ needs.build-backend.outputs.image_uri }}"
 
-          # Fetch current task def, swap the image only — all env vars are
-          # baked into the Dockerfile / CFT defaults. No secrets needed.
-          CURRENT_TASK=$(aws ecs describe-task-definition \
+          # Step 1 — fetch current task definition to a file
+          aws ecs describe-task-definition \
             --task-definition "$BACKEND_TASK_FAMILY" \
             --query "taskDefinition" \
-            --output json)
+            --output json > /tmp/backend-current.json
 
-          NEW_TASK=$(echo "$CURRENT_TASK" | jq \
-            --arg IMAGE "$NEW_IMAGE" \
-            '
-            # Update image on the backend container only (index 1, mongo is 0)
-            .containerDefinitions = (.containerDefinitions | map(
-              if .name | endswith("-backend") then .image = $IMAGE else . end
-            )) |
-            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
-                .compatibilities, .registeredAt, .registeredBy)
-            ')
+          echo "Container count in current task def:"
+          jq '.containerDefinitions | length' /tmp/backend-current.json
 
-          NEW_ARN=$(echo "$NEW_TASK" | aws ecs register-task-definition \
-            --cli-input-json file:///dev/stdin \
+          # Step 2 — swap backend container image, strip AWS read-only fields
+          jq --arg IMAGE "$NEW_IMAGE" '
+            .containerDefinitions = [
+              .containerDefinitions[] |
+              if (.name | endswith("-backend"))
+              then .image = $IMAGE
+              else .
+              end
+            ] |
+            del(
+              .taskDefinitionArn, .revision, .status,
+              .requiresAttributes, .compatibilities,
+              .registeredAt, .registeredBy, .deregisteredAt
+            )
+          ' /tmp/backend-current.json > /tmp/backend-new.json
+
+          # Step 3 — validate JSON before sending
+          echo "🔍 Validating JSON..."
+          jq empty /tmp/backend-new.json && echo "✅ JSON valid"
+
+          # Step 4 — register and capture new ARN
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/backend-new.json \
             --query "taskDefinition.taskDefinitionArn" \
             --output text)
 
           echo "backend_task_arn=$NEW_ARN" >> "$GITHUB_ENV"
-          echo "✅ Backend task definition registered: $NEW_ARN"
+          echo "✅ Backend task registered: $NEW_ARN"
 
       - name: Deploy backend service (DesiredCount → 1)
         run: |
@@ -297,29 +309,34 @@ jobs:
 
           NEW_IMAGE="${{ needs.build-frontend.outputs.image_uri }}"
 
-          CURRENT_TASK=$(aws ecs describe-task-definition \
+          # Step 1 — fetch current task definition to a file
+          aws ecs describe-task-definition \
             --task-definition "$FRONTEND_TASK_FAMILY" \
             --query "taskDefinition" \
-            --output json)
+            --output json > /tmp/frontend-current.json
 
-          NEW_TASK=$(echo "$CURRENT_TASK" | jq \
-            --arg IMAGE "$NEW_IMAGE" \
-            '
+          # Step 2 — swap image, strip AWS read-only fields
+          jq --arg IMAGE "$NEW_IMAGE" '
             .containerDefinitions[0].image = $IMAGE |
-            .containerDefinitions[0].environment = [
-              {"name": "NODE_ENV", "value": "production"}
-            ] |
-            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
-                .compatibilities, .registeredAt, .registeredBy)
-            ')
+            del(
+              .taskDefinitionArn, .revision, .status,
+              .requiresAttributes, .compatibilities,
+              .registeredAt, .registeredBy, .deregisteredAt
+            )
+          ' /tmp/frontend-current.json > /tmp/frontend-new.json
 
-          NEW_ARN=$(echo "$NEW_TASK" | aws ecs register-task-definition \
-            --cli-input-json file:///dev/stdin \
+          # Step 3 — validate JSON before sending
+          echo "🔍 Validating JSON..."
+          jq empty /tmp/frontend-new.json && echo "✅ JSON valid"
+
+          # Step 4 — register and capture new ARN
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/frontend-new.json \
             --query "taskDefinition.taskDefinitionArn" \
             --output text)
 
           echo "frontend_task_arn=$NEW_ARN" >> "$GITHUB_ENV"
-          echo "✅ Frontend task definition registered: $NEW_ARN"
+          echo "✅ Frontend task registered: $NEW_ARN"
 
       - name: Deploy frontend service (DesiredCount → 1)
         run: |
