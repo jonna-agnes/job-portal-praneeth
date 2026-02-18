@@ -1,0 +1,45 @@
+# -----------------------------------------------------------------------
+# Stage 1 — Build the Vite/React app
+# -----------------------------------------------------------------------
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy dependency manifests first (layer cache optimisation)
+COPY package.json package-lock.json ./
+
+# Install ALL deps (including devDependencies — needed for vite build)
+RUN npm ci
+
+# Copy source
+COPY . .
+
+# VITE_BACKEND_URL is injected at build time via --build-arg
+# This is the public IP / domain of your backend ECS task.
+# GitHub Actions will pass it in as a build arg.
+ARG VITE_BACKEND_URL=http://localhost:5000
+ENV VITE_BACKEND_URL=$VITE_BACKEND_URL
+
+RUN npm run build
+
+# -----------------------------------------------------------------------
+# Stage 2 — Serve with nginx (lightweight, production-grade)
+# -----------------------------------------------------------------------
+FROM nginx:1.25-alpine
+
+# Remove default nginx static assets
+RUN rm -rf /usr/share/nginx/html/*
+
+# Copy built assets from builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Custom nginx config — handles React Router (SPA fallback)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# Expose port 3000 (matches your CFT / ECS task definition)
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -qO- http://localhost:3000/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]

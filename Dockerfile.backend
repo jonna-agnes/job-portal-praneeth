@@ -1,0 +1,54 @@
+# -----------------------------------------------------------------------
+# Stage 1 — Install production dependencies only
+# -----------------------------------------------------------------------
+FROM node:20-alpine AS deps
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+
+# Install production deps only — no devDependencies in final image
+RUN npm ci --omit=dev
+
+# -----------------------------------------------------------------------
+# Stage 2 — Final runtime image
+# -----------------------------------------------------------------------
+FROM node:20-alpine
+
+# Security: run as non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+
+# Copy production node_modules from deps stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy application source
+COPY . .
+
+# Own everything as appuser
+RUN chown -R appuser:appgroup /app
+
+USER appuser
+
+# Fallback env vars — app runs fully without any GitHub secrets.
+# SECRET_KEY: used for JWT signing. Override in ECS task def for production.
+# MONGODB_URI: points to the mongo sidecar container (localhost:27017).
+# CLOUDINARY_*: left empty — file uploads fail gracefully, nothing crashes.
+ENV PORT=5000 \
+    NODE_ENV=production \
+    SECRET_KEY=job-portal-default-secret-change-in-prod \
+    MONGODB_URI=mongodb://localhost:27017/jobportal \
+    CLOUDINARY_CLOUD_NAME="" \
+    CLOUDINARY_API_KEY="" \
+    CLOUDINARY_API_SECRET="" \
+    FRONTEND_URL=http://localhost:3000
+
+# Expose port 5000 (matches CFT / ECS task definition)
+EXPOSE 5000
+
+# Health check — uses the root route which returns "Welcome to the server"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget -qO- http://localhost:5000/ || exit 1
+
+CMD ["node", "index.js"]

@@ -1,0 +1,493 @@
+name: 🚀 Deploy Job Portal to AWS ECS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Force deploy even if no code changes"
+        required: false
+        default: "false"
+
+# Cancel any in-progress deployment on the same branch
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-south-2
+  ECR_FRONTEND_REPO: job-portal-frontend
+  ECR_BACKEND_REPO: job-portal-backend
+  ECS_CLUSTER: job-portal-cluster
+  FRONTEND_SERVICE: job-portal-frontend-service
+  BACKEND_SERVICE: job-portal-backend-service
+  FRONTEND_TASK_FAMILY: job-portal-frontend-task
+  BACKEND_TASK_FAMILY: job-portal-backend-task
+
+# =========================================================================
+# JOBS
+# =========================================================================
+jobs:
+  # -----------------------------------------------------------------------
+  # JOB 1 — Run basic sanity tests before building anything
+  # -----------------------------------------------------------------------
+  test:
+    name: 🧪 Pre-Deploy Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- Test 1: Verify project structure is intact ---
+      - name: "Test 1/3 — Verify required project files exist"
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔍 Checking required files..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          REQUIRED_FILES=(
+            "Client/package.json"
+            "Client/index.html"
+            "Server/index.js"
+            "Server/package.json"
+            "Dockerfile.frontend"
+            "Dockerfile.backend"
+          )
+
+          FAILED=0
+          for FILE in "${REQUIRED_FILES[@]}"; do
+            if [ -f "$FILE" ]; then
+              echo "  ✅ $FILE"
+            else
+              echo "  ❌ MISSING: $FILE"
+              FAILED=1
+            fi
+          done
+
+          if [ $FAILED -eq 1 ]; then
+            echo ""
+            echo "❌ Test 1 FAILED — Missing required files. Aborting deployment."
+            exit 1
+          fi
+          echo ""
+          echo "✅ Test 1 PASSED — All required files present."
+
+      # --- Test 2: Validate frontend dependencies install cleanly ---
+      - name: "Test 2/3 — Frontend npm install check"
+        working-directory: Client
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 Validating frontend dependencies..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          npm ci --prefer-offline --no-audit
+          echo ""
+          echo "✅ Test 2 PASSED — Frontend deps install clean."
+
+      # --- Test 3: Validate backend dependencies install cleanly ---
+      - name: "Test 3/3 — Backend npm install check"
+        working-directory: Server
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 Validating backend dependencies..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          npm ci --prefer-offline --no-audit --omit=dev
+          echo ""
+          echo "✅ Test 3 PASSED — Backend deps install clean."
+
+      - name: "✅ All tests passed — proceeding to build"
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎉 3/3 tests passed. Starting Docker build + ECR push."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # -----------------------------------------------------------------------
+  # JOB 2 — Build backend image and push to ECR
+  # -----------------------------------------------------------------------
+  build-backend:
+    name: 🐳 Build & Push Backend Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push backend image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🐳 Building backend Docker image..."
+          echo "   Repo  : $REGISTRY/$ECR_BACKEND_REPO"
+          echo "   Tag   : $IMAGE_TAG"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          FULL_URI="$REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG"
+          LATEST_URI="$REGISTRY/$ECR_BACKEND_REPO:latest"
+
+          docker build \
+            -f Dockerfile.backend \
+            -t "$FULL_URI" \
+            -t "$LATEST_URI" \
+            ./Server
+
+          echo "📤 Pushing backend image to ECR..."
+          docker push "$FULL_URI"
+          docker push "$LATEST_URI"
+
+          echo "image_uri=$FULL_URI" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "✅ Backend image pushed successfully."
+          echo "   URI: $FULL_URI"
+
+  # -----------------------------------------------------------------------
+  # JOB 3 — Build frontend image and push to ECR
+  # Note: VITE_BACKEND_URL is baked in at build time via --build-arg.
+  # It points to the backend — since there's no LB/DNS, we use the
+  # ECS Service Connect internal DNS name format. For now it uses the
+  # env var you define in secrets. Update once you have a stable domain.
+  # -----------------------------------------------------------------------
+  build-frontend:
+    name: 🐳 Build & Push Frontend Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push frontend image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          # VITE_BACKEND_URL is baked at build time. Defaults to localhost:5000.
+          # After first deploy, note the backend task IP from the workflow output
+          # and update this value, then redeploy to point the frontend at it.
+          VITE_BACKEND_URL: "http://localhost:5000"
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🐳 Building frontend Docker image..."
+          echo "   Repo        : $REGISTRY/$ECR_FRONTEND_REPO"
+          echo "   Tag         : $IMAGE_TAG"
+          echo "   Backend URL : $VITE_BACKEND_URL"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          FULL_URI="$REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG"
+          LATEST_URI="$REGISTRY/$ECR_FRONTEND_REPO:latest"
+
+          docker build \
+            -f Dockerfile.frontend \
+            --build-arg VITE_BACKEND_URL="$VITE_BACKEND_URL" \
+            -t "$FULL_URI" \
+            -t "$LATEST_URI" \
+            ./Client
+
+          echo "📤 Pushing frontend image to ECR..."
+          docker push "$FULL_URI"
+          docker push "$LATEST_URI"
+
+          echo "image_uri=$FULL_URI" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "✅ Frontend image pushed successfully."
+          echo "   URI: $FULL_URI"
+
+  # -----------------------------------------------------------------------
+  # JOB 4 — Update ECS Task Definitions and trigger rolling deploy
+  # -----------------------------------------------------------------------
+  deploy:
+    name: 🚢 Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend]
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --- Deploy Backend ---
+      - name: Update backend ECS task definition with new image
+        id: backend-taskdef
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📝 Registering new backend task definition..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          NEW_IMAGE="${{ needs.build-backend.outputs.image_uri }}"
+
+          # Fetch current task def, swap the image only — all env vars are
+          # baked into the Dockerfile / CFT defaults. No secrets needed.
+          CURRENT_TASK=$(aws ecs describe-task-definition \
+            --task-definition "$BACKEND_TASK_FAMILY" \
+            --query "taskDefinition" \
+            --output json)
+
+          NEW_TASK=$(echo "$CURRENT_TASK" | jq \
+            --arg IMAGE "$NEW_IMAGE" \
+            '
+            # Update image on the backend container only (index 1, mongo is 0)
+            .containerDefinitions = (.containerDefinitions | map(
+              if .name | endswith("-backend") then .image = $IMAGE else . end
+            )) |
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy)
+            ')
+
+          NEW_ARN=$(echo "$NEW_TASK" | aws ecs register-task-definition \
+            --cli-input-json file:///dev/stdin \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "backend_task_arn=$NEW_ARN" >> "$GITHUB_ENV"
+          echo "✅ Backend task definition registered: $NEW_ARN"
+
+      - name: Deploy backend service (DesiredCount → 1)
+        run: |
+          echo "🚀 Updating backend ECS service..."
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$BACKEND_SERVICE" \
+            --task-definition "${{ env.backend_task_arn }}" \
+            --desired-count 1 \
+            --force-new-deployment \
+            --query "service.serviceName" \
+            --output text
+          echo "✅ Backend service update triggered."
+
+      # --- Deploy Frontend ---
+      - name: Update frontend ECS task definition with new image
+        id: frontend-taskdef
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📝 Registering new frontend task definition..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          NEW_IMAGE="${{ needs.build-frontend.outputs.image_uri }}"
+
+          CURRENT_TASK=$(aws ecs describe-task-definition \
+            --task-definition "$FRONTEND_TASK_FAMILY" \
+            --query "taskDefinition" \
+            --output json)
+
+          NEW_TASK=$(echo "$CURRENT_TASK" | jq \
+            --arg IMAGE "$NEW_IMAGE" \
+            '
+            .containerDefinitions[0].image = $IMAGE |
+            .containerDefinitions[0].environment = [
+              {"name": "NODE_ENV", "value": "production"}
+            ] |
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy)
+            ')
+
+          NEW_ARN=$(echo "$NEW_TASK" | aws ecs register-task-definition \
+            --cli-input-json file:///dev/stdin \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "frontend_task_arn=$NEW_ARN" >> "$GITHUB_ENV"
+          echo "✅ Frontend task definition registered: $NEW_ARN"
+
+      - name: Deploy frontend service (DesiredCount → 1)
+        run: |
+          echo "🚀 Updating frontend ECS service..."
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$FRONTEND_SERVICE" \
+            --task-definition "${{ env.frontend_task_arn }}" \
+            --desired-count 1 \
+            --force-new-deployment \
+            --query "service.serviceName" \
+            --output text
+          echo "✅ Frontend service update triggered."
+
+  # -----------------------------------------------------------------------
+  # JOB 5 — Poll ECS until both tasks are RUNNING, then print public IPs
+  # -----------------------------------------------------------------------
+  print-urls:
+    name: 🌐 Wait for Tasks & Print Live URLs
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for backend task to reach RUNNING state
+        id: backend-ip
+        timeout-minutes: 10
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⏳ Polling backend ECS service for RUNNING task..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          MAX_ATTEMPTS=20
+          SLEEP_SECONDS=30
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "  Attempt $i/$MAX_ATTEMPTS — waiting ${SLEEP_SECONDS}s..."
+            sleep $SLEEP_SECONDS
+
+            # Get the most recent running task ARN for the backend service
+            TASK_ARN=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --service-name "$BACKEND_SERVICE" \
+              --desired-status RUNNING \
+              --query "taskArns[0]" \
+              --output text 2>/dev/null)
+
+            if [ "$TASK_ARN" == "None" ] || [ -z "$TASK_ARN" ]; then
+              echo "  ⏳ No RUNNING task yet..."
+              continue
+            fi
+
+            # Get the ENI attachment ID
+            ENI_ID=$(aws ecs describe-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --tasks "$TASK_ARN" \
+              --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
+              --output text 2>/dev/null)
+
+            if [ -z "$ENI_ID" ] || [ "$ENI_ID" == "None" ]; then
+              echo "  ⏳ Task running but ENI not yet attached..."
+              continue
+            fi
+
+            # Resolve ENI → public IP
+            PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+              --network-interface-ids "$ENI_ID" \
+              --query "NetworkInterfaces[0].Association.PublicIp" \
+              --output text 2>/dev/null)
+
+            if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" == "None" ]; then
+              echo "  ⏳ ENI found but public IP not yet assigned..."
+              continue
+            fi
+
+            echo "backend_ip=$PUBLIC_IP" >> "$GITHUB_ENV"
+            echo "✅ Backend task is RUNNING — IP: $PUBLIC_IP"
+            break
+          done
+
+          if [ -z "${{ env.backend_ip }}" ]; then
+            echo "⚠️  Backend task did not reach RUNNING state in time."
+            echo "   Check ECS console for errors."
+            echo "backend_ip=UNAVAILABLE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Wait for frontend task to reach RUNNING state
+        id: frontend-ip
+        timeout-minutes: 10
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⏳ Polling frontend ECS service for RUNNING task..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          MAX_ATTEMPTS=20
+          SLEEP_SECONDS=30
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "  Attempt $i/$MAX_ATTEMPTS — waiting ${SLEEP_SECONDS}s..."
+            sleep $SLEEP_SECONDS
+
+            TASK_ARN=$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --service-name "$FRONTEND_SERVICE" \
+              --desired-status RUNNING \
+              --query "taskArns[0]" \
+              --output text 2>/dev/null)
+
+            if [ "$TASK_ARN" == "None" ] || [ -z "$TASK_ARN" ]; then
+              echo "  ⏳ No RUNNING task yet..."
+              continue
+            fi
+
+            ENI_ID=$(aws ecs describe-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --tasks "$TASK_ARN" \
+              --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
+              --output text 2>/dev/null)
+
+            if [ -z "$ENI_ID" ] || [ "$ENI_ID" == "None" ]; then
+              echo "  ⏳ Task running but ENI not yet attached..."
+              continue
+            fi
+
+            PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+              --network-interface-ids "$ENI_ID" \
+              --query "NetworkInterfaces[0].Association.PublicIp" \
+              --output text 2>/dev/null)
+
+            if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" == "None" ]; then
+              echo "  ⏳ ENI found but public IP not yet assigned..."
+              continue
+            fi
+
+            echo "frontend_ip=$PUBLIC_IP" >> "$GITHUB_ENV"
+            echo "✅ Frontend task is RUNNING — IP: $PUBLIC_IP"
+            break
+          done
+
+          if [ -z "${{ env.frontend_ip }}" ]; then
+            echo "⚠️  Frontend task did not reach RUNNING state in time."
+            echo "frontend_ip=UNAVAILABLE" >> "$GITHUB_ENV"
+          fi
+
+      # ---- THE MONEY STEP — print the live URLs ----
+      - name: 🎉 Print Live URLs
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║           🚀 DEPLOYMENT COMPLETE             ║"
+          echo "╠══════════════════════════════════════════════╣"
+          echo "║                                              ║"
+          echo "║  🌐 FRONTEND                                 ║"
+          echo "║  http://${{ env.frontend_ip }}:3000          ║"
+          echo "║                                              ║"
+          echo "║  ⚙️  BACKEND API                             ║"
+          echo "║  http://${{ env.backend_ip }}:5000           ║"
+          echo "║                                              ║"
+          echo "║  📋 Commit : ${{ github.sha }}               ║"
+          echo "║  🕐 Time   : $(date -u '+%Y-%m-%d %H:%M UTC')║"
+          echo "╚══════════════════════════════════════════════╝"
+          echo ""
+          echo "⚠️  NOTE: IPs are ephemeral. Each new ECS deployment"
+          echo "   may assign a different public IP. For a stable URL,"
+          echo "   add an ALB or Elastic IP in a future iteration."
