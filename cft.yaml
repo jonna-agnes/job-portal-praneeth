@@ -1,0 +1,623 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Job Portal Infrastructure — VPC, Subnets, ECR (frontend + backend),
+  ECS Fargate Cluster with 2 Services (desired=0, no rollback).
+  Region: ap-south-2 (Hyderabad)
+  No RDS. No Load Balancer. No Auto Scaling.
+
+# -----------------------------------------------------------------------
+# PARAMETERS
+# -----------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: job-portal
+    Description: Used as a prefix for all resource names.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.3.0/24
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.4.0/24
+
+  FrontendContainerPort:
+    Type: Number
+    Default: 3000
+
+  BackendContainerPort:
+    Type: Number
+    Default: 5000
+
+  FrontendImageTag:
+    Type: String
+    Default: latest
+    Description: ECR image tag for the frontend service.
+
+  BackendImageTag:
+    Type: String
+    Default: latest
+    Description: ECR image tag for the backend service.
+
+# -----------------------------------------------------------------------
+# RESOURCES
+# -----------------------------------------------------------------------
+Resources:
+  # =====================================================================
+  # VPC
+  # =====================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+
+  # =====================================================================
+  # INTERNET GATEWAY
+  # =====================================================================
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # =====================================================================
+  # SUBNETS — 2 Public, 2 Private (ap-south-2a / ap-south-2b)
+  # =====================================================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: ap-south-2a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: ap-south-2b
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet-2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: ap-south-2a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: ap-south-2b
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-2"
+
+  # =====================================================================
+  # ROUTE TABLES
+  # =====================================================================
+
+  # --- Public Route Table ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Private Route Table (local only — no NAT Gateway) ---
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-rt"
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =====================================================================
+  # SECURITY GROUPS
+  # =====================================================================
+
+  # --- Frontend SG: allow inbound on port 3000 ---
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound traffic to frontend container
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref FrontendContainerPort
+          ToPort: !Ref FrontendContainerPort
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-frontend-sg"
+
+  # --- Backend SG: allow inbound on port 5000 (from anywhere / tighten later) ---
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound traffic to backend container
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref BackendContainerPort
+          ToPort: !Ref BackendContainerPort
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-backend-sg"
+
+  # =====================================================================
+  # ECR REPOSITORIES
+  # =====================================================================
+  FrontendECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-frontend"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-frontend-ecr"
+
+  BackendECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-backend"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-backend-ecr"
+
+  # =====================================================================
+  # IAM — ECS Task Execution Role
+  # =====================================================================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecs-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-ecr-pull-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # =====================================================================
+  # CLOUDWATCH LOG GROUPS
+  # =====================================================================
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/frontend"
+      RetentionInDays: 7
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}/backend"
+      RetentionInDays: 7
+
+  # =====================================================================
+  # ECS CLUSTER
+  # =====================================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-cluster"
+
+  # =====================================================================
+  # ECS TASK DEFINITIONS
+  # NOTE: Image URI uses a placeholder tag. ECR will be empty until
+  # GitHub Actions pushes the first image. DesiredCount=0 on both
+  # services so ECS does NOT try to pull or run anything yet.
+  # =====================================================================
+
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-frontend-task"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "${ProjectName}-frontend"
+          # Image URI: replace <ACCOUNT_ID> or let GitHub Actions update this
+          # via `aws ecs update-service` after pushing to ECR.
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frontend:${FrontendImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref FrontendContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            # Update VITE_BACKEND_URL once backend task gets a stable IP/DNS
+            - Name: VITE_BACKEND_URL
+              Value: !Sub "http://localhost:${BackendContainerPort}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+          # Graceful crash handling — no restart loops blowing up your stack
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "curl -f http://localhost:${FrontendContainerPort}/ || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-backend-task"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      # Bumped to 512 CPU / 1024 MB to comfortably run Node + MongoDB sidecar
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        # ------------------------------------------------------------------
+        # Container 1 — MongoDB sidecar
+        # Runs on localhost:27017 inside the task (awsvpc shares network).
+        # Data is ephemeral — resets when task restarts. Fine for dev/demo.
+        # ------------------------------------------------------------------
+        - Name: !Sub "${ProjectName}-mongo"
+          Image: mongo:7
+          Essential: true
+          PortMappings:
+            - ContainerPort: 27017
+              Protocol: tcp
+          Environment:
+            - Name: MONGO_INITDB_DATABASE
+              Value: jobportal
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: mongo
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - mongosh --eval "db.adminCommand('ping')" --quiet || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 5
+            StartPeriod: 60
+
+        # ------------------------------------------------------------------
+        # Container 2 — Node/Express backend
+        # Waits for mongo to be healthy before starting (DependsOn).
+        # ------------------------------------------------------------------
+        - Name: !Sub "${ProjectName}-backend"
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-backend:${BackendImageTag}"
+          Essential: true
+          DependsOn:
+            - ContainerName: !Sub "${ProjectName}-mongo"
+              Condition: HEALTHY
+          PortMappings:
+            - ContainerPort: !Ref BackendContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: !Sub "${BackendContainerPort}"
+            # MongoDB on localhost — sidecar shares the task network namespace
+            - Name: MONGODB_URI
+              Value: mongodb://localhost:27017/jobportal
+            # Default JWT secret — works out of the box, override for prod
+            - Name: SECRET_KEY
+              Value: job-portal-default-secret-change-in-prod
+            - Name: CLOUDINARY_CLOUD_NAME
+              Value: ""
+            - Name: CLOUDINARY_API_KEY
+              Value: ""
+            - Name: CLOUDINARY_API_SECRET
+              Value: ""
+            - Name: FRONTEND_URL
+              Value: http://localhost:3000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "wget -qO- http://localhost:${BackendContainerPort}/ || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # =====================================================================
+  # ECS SERVICES
+  # DesiredCount: 0 — infrastructure is created, nothing runs until
+  # you push images via GitHub Actions and bump DesiredCount to 1.
+  # DeploymentController: EXTERNAL prevents CloudFormation from rolling
+  # back the service on image-not-found errors.
+  # =====================================================================
+
+  FrontendECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - FrontendTaskDefinition
+      - ECSCluster
+    Properties:
+      ServiceName: !Sub "${ProjectName}-frontend-service"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      # IMPORTANT: No DeploymentController override — default (ECS rolling)
+      # is fine since DesiredCount is 0. Nothing will be scheduled.
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: false # ← no rollback on failure
+          Rollback: false # ← no rollback on failure
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # Placed in public subnets so tasks can reach ECR without NAT GW
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+          AssignPublicIp: ENABLED
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-frontend-service"
+
+  BackendECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - BackendTaskDefinition
+      - ECSCluster
+    Properties:
+      ServiceName: !Sub "${ProjectName}-backend-service"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: false # ← no rollback on failure
+          Rollback: false # ← no rollback on failure
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+          AssignPublicIp: ENABLED
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-backend-service"
+
+# -----------------------------------------------------------------------
+# OUTPUTS — handy refs for your GitHub Actions workflow
+# -----------------------------------------------------------------------
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${ProjectName}-vpc-id"
+
+  PublicSubnet1Id:
+    Description: Public Subnet 1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub "${ProjectName}-public-subnet-1-id"
+
+  PublicSubnet2Id:
+    Description: Public Subnet 2
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub "${ProjectName}-public-subnet-2-id"
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub "${ProjectName}-private-subnet-1-id"
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub "${ProjectName}-private-subnet-2-id"
+
+  ECSClusterName:
+    Description: ECS Cluster Name (use in GitHub Actions)
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub "${ProjectName}-cluster-name"
+
+  FrontendECRUri:
+    Description: Frontend ECR Repository URI (use in GitHub Actions docker push)
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frontend"
+    Export:
+      Name: !Sub "${ProjectName}-frontend-ecr-uri"
+
+  BackendECRUri:
+    Description: Backend ECR Repository URI (use in GitHub Actions docker push)
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-backend"
+    Export:
+      Name: !Sub "${ProjectName}-backend-ecr-uri"
+
+  FrontendServiceName:
+    Description: Frontend ECS Service Name
+    Value: !GetAtt FrontendECSService.Name
+    Export:
+      Name: !Sub "${ProjectName}-frontend-service-name"
+
+  BackendServiceName:
+    Description: Backend ECS Service Name
+    Value: !GetAtt BackendECSService.Name
+    Export:
+      Name: !Sub "${ProjectName}-backend-service-name"
+
+  FrontendTaskDefinitionArn:
+    Description: Frontend Task Definition ARN
+    Value: !Ref FrontendTaskDefinition
+
+  BackendTaskDefinitionArn:
+    Description: Backend Task Definition ARN
+    Value: !Ref BackendTaskDefinition
